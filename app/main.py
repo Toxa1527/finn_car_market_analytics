@@ -3,7 +3,6 @@
 ###
 from streamlit_autorefresh import st_autorefresh
 import streamlit as st
-from lang import TEXTS
 import pandas as pd
 import subprocess
 import sqlite3
