@@ -1,11 +1,27 @@
-# finn_project_v1_release/parser/finn_scraper.py #
+#parser/finn_scraper.py
 
 ###
 from playwright.async_api import async_playwright
+from parser.geo_parser import extract_location
 from bs4 import BeautifulSoup
 from config import BASE_URL
 import asyncio
+import random
 import re
+import os
+import json
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+
+###
+
+def save_config(data):
+    tmp = f"{CONFIG_PATH}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+    os.replace(tmp, CONFIG_PATH)
+
 ###
 
 async def detch_page_data(page_num, browser, car_count_start):
@@ -14,15 +30,13 @@ async def detch_page_data(page_num, browser, car_count_start):
     """
     page_url = f"{BASE_URL}&page={page_num}"
 
-###
-
+### # №1. Какую конкретно страницу мы парсим.
     print(f"[PARSER] Открываем вкладку под страницу {page_num}...")
 
     page = await browser.new_page()
     try:
         await page.goto(page_url, timeout=60000, wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
-#        await page.wait_for_load_state("networkidle")
         html_content = await page.content()
     except Exception as e:
         print(f"[ERROR] {page_num}: {e}")
@@ -87,26 +101,8 @@ async def detch_page_data(page_num, browser, car_count_start):
         id_match = re.search(r'/(\d+)(?:\?|$)', href)
         car_id = id_match.group(1) if id_match else f"id_{local_count}"
 
-        #Локация (Город / Регион) Псс. в разработке)
-        location = "Не указано"
-        strings = list(card.stripped_strings)
-
-###
-
-        for text in reversed(strings):
-            clean_text = text.replace("•", "").strip()
-
-            if not clean_text or len(clean_text) < 2 or len(clean_text) > 35:
-                continue
-            if any(word in clean_text.lower() for word in ["forhandler", "privat", "kr", "km", "totalpris", "omreg", "eks.", "inkl.", "solgt", "reservert", "diesel", "bensin", "hybrid", "elektrisitet", "automat", "manuell"]):
-                continue
-            if re.search(r'\d', clean_text):
-                continue
-            if clean_text.lower() == title.lower():
-                continue
-
-            location = clean_text
-            break
+        # Локация (Город / Регион)
+        location = extract_location(card)
 
         car_data = {
             "car_id": car_id,
@@ -119,13 +115,71 @@ async def detch_page_data(page_num, browser, car_count_start):
             "location": location,
             "url": full_url
         }
+
         page_cars.append(car_data)
         print(f" Собрано: {title} [{year} --- {price}]")
 
-###
-
+### # №2. Страница полностью отработала и сколько на ней машин.
     print(f"[PARSER] <<< Страница {page_num} полностью готова. Найдено машин: {len(page_cars)}")
     return page_cars
+
+###
+
+from database.db_manager import delete_car, get_cars_for_maintenance, update_car_location
+
+async def check_single_car_url(browser, car_id: str, url: str, sem: asyncio.Semaphore):
+    """Проверяет одну машину по прямой ссылке: удаляет неликвид или обновляет город."""
+    async with sem:
+        print(f"[CHECK] Проверяю {car_id}...")
+
+        page = await browser.new_page()
+
+        try:
+            await asyncio.sleep(random.uniform(3.5, 6.5))
+            resp = await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+
+            if resp and resp.status in (404, 410):
+                await delete_car(car_id)
+                return
+
+            await page.wait_for_timeout(2500)
+            html = await page.content()
+            soup = BeautifulSoup(html, "html.parser")
+            page_text = soup.get_text(" ", strip=True)
+
+            if "Access is temporarily restricted" in html:
+                print("[BAN] FINN временно ограничил доступ! Останавливаемся.")
+                raise RuntimeError("IP_BANNED")
+
+            if any(flag in page_text for flag in [
+                "Denne annonsen er ikke lenger tilgjengelig",
+                "Bilen er solgt",
+                "Annonsen er utløpt",
+                "Annonsen er slettet"
+            ]):
+                await delete_car(car_id)
+                return
+
+            new_loc = "Не указано"
+
+            map_link = soup.select_one('a[href*="/map?"]')
+            if map_link:
+                raw_addr = map_link.get_text(" ", strip=True)
+                clean_match = re.search(r'\b\d{4}\s+(.+)$', raw_addr)
+                new_loc = clean_match.group(1).strip() if clean_match else raw_addr
+
+
+            if new_loc == "Не указано":
+                print(f"[DEBUG] Title: {soup.title.string if soup.title else 'None'} | Snippet: {page_text[:250]}")
+                print(f"[DEBUG] URL: {page.url} | Title: {await page.title()}")
+
+            print(f"[FOUND] {car_id} -> {new_loc}")
+            await update_car_location(car_id, new_loc)
+
+        except Exception as e:
+            print(f"[CLEANER ERR] {car_id}: {e}")
+        finally:
+            await page.close()
 
 ###
 
@@ -157,21 +211,14 @@ async def scrape_finn_cars():
     sem = asyncio.Semaphore(1)
 
     async def sem_fetch(page_num, browser):
-        nonlocal completed_pages
 
-        if os.path.exists(CONFIG_PATH):
-            try:
-                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                    if json.load(f).get("mode") == "manual":
-                        return []  # Экстренно прерываем сбор этой страницы
-            except Exception:
-                pass
+        nonlocal completed_pages
 
         async with sem:
             page_data = await detch_page_data(page_num, browser, car_count_start=(page_num - 1)* 50)
             completed_pages += 1
 
-            progress_precent = int((completed_pages / max_pages) * 100)
+            progress_precent = int((completed_pages / max_pages) * 85)
 
             if os.path.exists(CONFIG_PATH):
                 try:
@@ -179,46 +226,75 @@ async def scrape_finn_cars():
                         c_data = json.load(f)
                     c_data["status"] = "running"
                     c_data["progress"] = progress_precent
-                    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                        json.dump(c_data, f, indent=4, ensure_ascii=False)
+                    c_data["status"] = "running"
+                    c_data["progress"] = max(c_data.get("progress", 0), progress_precent)
+                    save_config(c_data)
+
                 except Exception:
                     pass
 
             return page_data
 
 ###
-    results = []
+
     async with async_playwright() as p:
         print("[PARSER] Запуск общего браузера для параллельных задач...")
-        browser = None
+
+
+        HEADLESS_MODE = True
+
+        browser = await p.chromium.launch_persistent_context(
+            user_data_dir="./finn_profile",
+            headless=HEADLESS_MODE,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--headless=new" if HEADLESS_MODE else ""
+            ]
+        )
+
+        tasks = [sem_fetch(page_num, browser) for page_num in range(1, max_pages + 1)]
+        print(f"[PARSER] Запуск {max_pages} страниц через асинхронную очередь семафора...")
+
+        results =  await asyncio.gather(*tasks)
+
+###
+
+        old_cars = await get_cars_for_maintenance(only_missing_location=False, limit=15)
+        if old_cars:
+            print(f"[CLEANER] Тихая проверка {len(old_cars)} старых машин из БД...")
+            clean_sem = asyncio.Semaphore(1)
+            for idx, (cid, curl) in enumerate(old_cars, start=1):
+                if curl:
+                    try:
+                        await check_single_car_url(browser, cid, curl, clean_sem)
+                        if os.path.exists(CONFIG_PATH):
+                            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                                c_data = json.load(f)
+                            c_data["progress"] = 85 + int((idx / len(old_cars)) *15)
+                            save_config(c_data)
+                    except RuntimeError as e:
+                        if "IP_BANNED" in str(e):
+                            print("[CLEANER] Пауза фоновой проверки до следующего цикла.")
+                            break
+        await browser.close()
+
+###
+
+    if os.path.exists(CONFIG_PATH):
         try:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",  # Защита от краша памяти
-                    "--user-agent=Mozilla/5.0 (Windows NT 10.0; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                ]
-            )
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                c_data = json.load(f)
+            c_data["status"] = "sleeping"
+            c_data["progress"] = 0
+            save_config(c_data)
+        except Exception:
+            pass
 
-            tasks = [sem_fetch(page_num, browser) for page_num in range(1, max_pages + 1)]
-            print(f"[PARSER] Запуск {max_pages} страниц через асинхронную очередь семафора...")
-
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        except Exception as e:
-            print(f"[ERROR] Сбой работы браузера: {e}")
-        finally:
-            if browser:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
+###
 
     cars_list = []
     for page_results in results:
-        if isinstance(page_results, list):
-            cars_list.extend(page_results)
+        cars_list.extend(page_results)
 
     return cars_list
-

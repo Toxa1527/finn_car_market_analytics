@@ -1,0 +1,8 @@
+{
+    "mode": "manual",
+    "interval_minutes": 1,
+    "max_pages": 1,
+    "status": "sleeping",
+    "time_left_seconds": 0,
+    "progress": 0
+}
